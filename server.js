@@ -1,72 +1,66 @@
 const express = require('express');
 const multer = require('multer');
-const Anthropic = require('@anthropic-ai/sdk');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Store upload in memory (no disk writes needed - this is a test app)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ['image/jpeg', 'image/jpg', 'image/png', 'image/heic', 'image/webp'];
-    if (allowed.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only image files are accepted (JPG, PNG, HEIC, WEBP)'));
-    }
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only image files accepted (JPG, PNG, HEIC, WEBP)'));
   }
 });
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ─── Main scan endpoint ───────────────────────────────────────────────────────
+function bufferToImagePart(buffer, mimeType) {
+  return {
+    inlineData: {
+      data: buffer.toString('base64'),
+      mimeType: mimeType === 'image/jpg' ? 'image/jpeg' : mimeType
+    }
+  };
+}
+
+function parseJSON(text) {
+  const clean = text.replace(/```json|```/g, '').trim();
+  return JSON.parse(clean);
+}
+
 app.post('/api/scan', upload.single('receipt'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No image file uploaded.' });
   }
 
-  const b64 = req.file.buffer.toString('base64');
-  const mediaType = req.file.mimetype === 'image/jpg' ? 'image/jpeg' : req.file.mimetype;
+  const imagePart = bufferToImagePart(req.file.buffer, req.file.mimetype);
 
-  // ── Step 1: Validate it's actually a grocery receipt ──────────────────────
+  // Step 1: Validate it's a grocery receipt
   let validationResult;
   try {
-    const validation = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 200,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: mediaType, data: b64 } },
-          {
-            type: 'text',
-            text: `Is this image a grocery store receipt? 
-            
-Grocery receipts come from stores like ShopRite, Stop & Shop, King Kullen, Aldi, Walmart, Trader Joe's, Whole Foods, Target, Costco, BJ's, Wegmans, Key Food, Western Beef, or any supermarket/grocery store.
+    const validationPrompt = `Is this image a grocery store receipt?
 
-Reject anything that is NOT a grocery receipt: restaurant bills, Amazon orders, gas station receipts (unless they include a grocery section), clothing store receipts, pharmacy-only receipts, gym receipts, hotel bills, etc.
+Grocery receipts come from stores like ShopRite, Stop & Shop, King Kullen, Aldi, Walmart, Trader Joe's, Whole Foods, Target, Costco, BJ's, Wegmans, Key Food, or any supermarket.
 
-Also reject if the image is blurry, unreadable, or not a receipt at all.
+Reject if it is: a restaurant bill, Amazon order, gas station receipt, clothing store, pharmacy-only, gym, hotel, or not a receipt at all. Also reject if blurry or unreadable.
 
-Respond ONLY with valid JSON:
+Respond ONLY with valid JSON, no markdown:
 {
   "is_grocery_receipt": true or false,
   "confidence": "high" or "medium" or "low",
   "store_detected": "store name or null",
-  "rejection_reason": "reason if not a grocery receipt, otherwise null"
-}`
-          }
-        ]
-      }]
-    });
+  "rejection_reason": "reason if rejected, otherwise null"
+}`;
 
-    const raw = validation.content[0].text.replace(/```json|```/g, '').trim();
-    validationResult = JSON.parse(raw);
+    const validationRes = await model.generateContent([validationPrompt, imagePart]);
+    validationResult = parseJSON(validationRes.response.text());
   } catch (err) {
     return res.status(500).json({ error: 'Failed to validate image: ' + err.message });
   }
@@ -75,22 +69,12 @@ Respond ONLY with valid JSON:
     return res.status(422).json({
       error: 'not_a_grocery_receipt',
       message: validationResult.rejection_reason || 'This does not appear to be a grocery store receipt.',
-      store_detected: null
     });
   }
 
-  // ── Step 2: Full receipt extraction ──────────────────────────────────────
+  // Step 2: Full extraction
   try {
-    const extraction = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: mediaType, data: b64 } },
-          {
-            type: 'text',
-            text: `You are an expert grocery receipt parser. Carefully read every detail of this receipt.
+    const extractionPrompt = `You are an expert grocery receipt parser. Carefully read every detail of this receipt.
 
 This may be from ShopRite (uses "Price Plus" loyalty card), Stop & Shop (uses "GO Rewards" card), King Kullen, Aldi, Walmart, Trader Joe's, Whole Foods, or another grocery store on Long Island, NY.
 
@@ -125,7 +109,7 @@ Extract ALL information and return ONLY valid JSON with no markdown, no explanat
       "is_taxable": false,
       "discount_amount": null,
       "category": "produce / dairy / meat / bakery / frozen / pantry / beverages / household / personal care / deli / other",
-      "notes": "any relevant notes like per lb pricing, multipack, etc. or null"
+      "notes": "any notes like per lb pricing, multipack, etc. or null"
     }
   ],
   "summary": {
@@ -149,25 +133,21 @@ Extract ALL information and return ONLY valid JSON with no markdown, no explanat
     "points_balance": null,
     "ytd_savings": null
   },
-  "raw_notes": "any other text on the receipt not captured above like store hours, return policy, survey info, etc."
+  "raw_notes": "any other text on the receipt not captured above"
 }
 
-IMPORTANT RULES:
-- final_price is what the customer actually paid for the item (after all discounts)
-- regular_price is the shelf price before any discounts
-- loyalty_price is the member/card price specifically
-- Decode ALL abbreviations: CHKN BRST = Chicken Breast, WHL MLK = Whole Milk, OJ = Orange Juice, BF = Beef, etc.
-- For weighted items (e.g. "1.23 lb @ $2.99/lb"), include weight and calculate final_price
+IMPORTANT:
+- final_price = what customer actually paid after all discounts
+- regular_price = shelf price before discounts
+- loyalty_price = member card price specifically
+- Decode ALL abbreviations: CHKN BRST = Chicken Breast, WHL MLK = Whole Milk, OJ = Orange Juice
+- For weighted items (e.g. 1.23 lb @ $2.99/lb) include weight and calculate final_price
 - All prices MUST be numbers, never strings
 - Unknown values = null
-- Do NOT skip any line items, even if they are discounts, fees, or deposits`
-          }
-        ]
-      }]
-    });
+- Do NOT skip any line items including discounts, fees, or deposits`;
 
-    const raw = extraction.content[0].text.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(raw);
+    const extractionRes = await model.generateContent([extractionPrompt, imagePart]);
+    const parsed = parseJSON(extractionRes.response.text());
 
     return res.json({
       success: true,
@@ -180,14 +160,11 @@ IMPORTANT RULES:
   }
 });
 
-// ─── Error handler for multer ─────────────────────────────────────────────────
 app.use((err, req, res, next) => {
   if (err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(400).json({ error: 'Image too large. Maximum size is 10MB.' });
+    return res.status(400).json({ error: 'Image too large. Max size is 10MB.' });
   }
   return res.status(400).json({ error: err.message });
 });
 
-app.listen(PORT, () => {
-  console.log(`Receipt scanner running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Receipt scanner running on port ${PORT}`));
